@@ -522,4 +522,251 @@ def get_due_date(page):
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
             r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date.*?(\d{1,2
+            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                due_date = match.group(1).strip()
+                log(f"📅 获取到 Due Date: {due_date}")
+                return due_date
+    except Exception as e:
+        log(f"❌ 获取 Due Date 失败: {e}")
+    return "未知"
+
+def renew_service(page):
+    """续期服务全流程（含容错与重试逻辑）"""
+    try:
+        log("➡ 进入续期流程...")
+
+        renew_btn = page.locator('button:has-text("Renew")')
+        create_btn = page.locator('button:has-text("Create Invoice")')
+
+        # 最多重试 3 轮完整续费流程
+        for attempt in range(1, 4):
+            log(f"🔄 【续期尝试第 {attempt}/3 次】")
+
+            if SERVICE_URL not in page.url:
+                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                solve_turnstile(page, timeout=30, success_check=page_ready)
+
+            # 1. 检查是否未到续期时间
+            body_text = page.locator("body").inner_text()
+            if "can only renew" in body_text.lower() or "renewal restricted" in body_text.lower():
+                log("⚠️ 未到续期时间，无法续期。")
+                page.screenshot(path="renew_not_allowed.png")
+                return "NOT_TIME"
+
+            # 2. 尝试点击 Renew 按钮弹出弹窗
+            modal_opened = False
+            for i in range(5):
+                try:
+                    renew_btn.wait_for(state="visible", timeout=8000)
+                    renew_btn.scroll_into_view_if_needed()
+                    log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
+                    renew_btn.click()
+
+                    time.sleep(2)
+                    page_text = page.locator("body").inner_text()
+                    if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+                        log("⚠️ 未到续期时间，无法续期。")
+                        page.screenshot(path="renew_not_allowed.png")
+                        return "NOT_TIME"
+
+                    log("🖲️ 等待弹窗出现...")
+                    try:
+                        create_btn.wait_for(state="visible", timeout=4000)
+                        modal_opened = True
+                        log("✅ 弹窗已成功弹出！")
+                        break
+                    except Exception:
+                        if challenge_boxes(page):
+                            modal_opened = True
+                            log("✅ 弹窗已弹出（包含 Turnstile 验证）！")
+                            break
+                        time.sleep(2)
+                except Exception as e:
+                    log(f"❌ 点击 'Renew' 尝试出错: {e}")
+
+            if not modal_opened:
+                log("⚠️ 尝试多次后，续费弹窗未弹出，刷新页面重试...")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                continue
+
+            # 3. 弹窗内的 Turnstile：严格确保获取到 Token 后才允许往下走！
+            log("🛡️ 处理弹窗内的 Turnstile 验证...")
+            token_passed = solve_turnstile(
+                page,
+                timeout=90,
+                success_check=has_turnstile_token, # 强校验 condition: 必须在 hidden input 中拿到 token
+                require_positive=True,
+                shot_on_timeout=f"modal_turnstile_fail_attempt{attempt}.png"
+            )
+
+            if not token_passed and not has_turnstile_token(page):
+                log("❌ 弹窗内未获取到有效 Token，拒绝提交！刷新页面重新发起续期...")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                continue
+
+            log("✅ 验证通过，已成功捕获有效 cf-turnstile-response Token！")
+
+            # 4. 点击 Create Invoice 按钮
+            create_clicked = False
+            for i in range(3):
+                try:
+                    log(f"🖱️ 点击 'Create Invoice'（第 {i+1} 次）...")
+                    create_btn.wait_for(state="visible", timeout=5000)
+                    create_btn.click(timeout=8000)
+                    create_clicked = True
+                    break
+                except Exception as e:
+                    log(f"⚠️ 点击 'Create Invoice' 失败: {e}")
+                    time.sleep(2)
+
+            if not create_clicked:
+                log("❌ 无法点击 'Create Invoice'，刷新重试本轮流程...")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                continue
+
+            # 5. 等待页面跳转至发票页，或检测是否被服务器退回报错
+            log("⏳ 等待跳转至发票页面...")
+            start_wait = time.time()
+            got_invoice = False
+            failed_by_turnstile_error = False
+
+            while time.time() - start_wait < 60:
+                if "/payment/invoice/" in page.url:
+                    got_invoice = True
+                    log(f"🎉 页面已成功跳转至发票页: {page.url}")
+                    break
+
+                # 实时检测页面是否出现缺失 Token 的报错
+                try:
+                    page_html = page.content()
+                    if "cf-turnstile-response field is required" in page_html or ("Turnstile" in page_html and "required" in page_html):
+                        log("❌ 服务器返回错误：'The cf-turnstile-response field is required.'，验证未生效！")
+                        failed_by_turnstile_error = True
+                        page.screenshot(path=f"turnstile_req_err_attempt{attempt}.png")
+                        break
+                except Exception:
+                    pass
+
+                if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                    solve_turnstile(page, timeout=30, reload_after=8)
+
+                time.sleep(1.5)
+
+            if failed_by_turnstile_error:
+                log("🔄 因 Token 校验被拒，刷新页面开始下一轮重试...")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                continue
+
+            if not got_invoice:
+                log("❌ 未能在规定时间内进入发票页面，刷新重试...")
+                page.screenshot(path=f"renew_stuck_invoice_attempt{attempt}.png")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                continue
+
+            # 6. 进入发票页面，点击 Pay 按钮
+            solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+            log("🔎 查找 'Pay' 按钮...")
+            try:
+                pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible, a:has-text("支付"):visible, button:has-text("支付"):visible').first
+                pay_btn.wait_for(state="visible", timeout=30000)
+                pay_btn.click()
+                log("✅ 'Pay' 按钮已成功点击。")
+            except Exception as e:
+                log(f"⚠️ 点击 Pay 按钮失败或未找到: {e}")
+
+            time.sleep(5)
+            # 返回服务页面查看最新到期时间
+            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+            solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+            return True
+
+        log("❌ 经过多次重试，续续费依然失败。")
+        page.screenshot(path="renew_failed_final.png")
+        return False
+
+    except Exception as e:
+        log(f"❌ 续费过程发生异常: {e}")
+        page.screenshot(path="renew_error.png")
+        return False
+
+def main():
+    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
+        f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
+    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
+        log("❌ 缺少登录凭证")
+        sys.exit(1)
+
+    global SERVICE_URL
+
+    with sync_playwright() as p:
+        try:
+            if IS_PROXY:
+                log(f"⚙️ 代理已启用: {PROXY_SERVER}")
+            else:
+                log("🌐 直连模式（未使用代理）")
+
+            current_ip = get_current_ip(PROXY_SERVER)
+            log(f"🎯 当前出口IP: {current_ip}")
+
+            log("🚀 启动浏览器...")
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=False,
+                args=['--no-sandbox', '--disable-blink-features=AutomationControlled',
+                      '--disable-infobars', '--window-size=1920,1080']
+            )
+
+            context = browser.new_context(
+                no_viewport=True,
+                proxy={"server": PROXY_SERVER} if IS_PROXY else None
+            )
+            page = context.new_page()
+            page.add_init_script(STEALTH_JS)
+
+            if not login(page):
+                sys.exit(1)
+
+            server_id = get_server_id(page)
+            if not server_id:
+                log("❌ 无法获取 Server ID，退出。")
+                sys.exit(1)
+            SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
+
+            old_due = get_due_date(page)
+            log(f"📆 续费前到期时间：{old_due}")
+
+            renew_result = renew_service(page)
+
+            new_due = old_due
+            if renew_result == "NOT_TIME":
+                log("⏳ 未到续期时间，目前无需续期")
+                status = "⏳ 未到续期时间"
+            elif renew_result is False:
+                log("❌ 续费失败，脚本退出。")
+                status = "❌ 续期失败"
+            else:
+                new_due = get_due_date(page)
+                log(f"📆 续费后到期时间：{new_due}")
+                status = "✅ 续期成功"
+
+            send_telegram_notification(status, old_due, new_due)
+
+            if renew_result == "NOT_TIME":
+                sys.exit(0)
+            elif renew_result is False:
+                sys.exit(1)
+            else:
+                sys.exit(0)
+        except Exception as e:
+            log(f"❌ 浏览器启动或运行出错: {e}")
+            sys.exit(1)
+        finally:
+            if 'browser' in locals() and browser:
+                browser.close()
+
+if __name__ == "__main__":
+    main()
